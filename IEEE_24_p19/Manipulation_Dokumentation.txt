@@ -1,6 +1,0 @@
-Multiply cf of w5, w6, w7 by a factor of 2.
-
-
-Scale Demand by a factor of 2
-
-Manipulate Cost factors so none of the generators have the same costs
