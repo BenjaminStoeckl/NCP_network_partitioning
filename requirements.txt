@@ -1,0 +1,6 @@
+numpy~=1.23.5
+pandas~=1.5.3
+pyomo~=6.8.0
+matplotlib~=3.7.1
+scikit-learn~=1.2.1
+scipy~=1.10.0
