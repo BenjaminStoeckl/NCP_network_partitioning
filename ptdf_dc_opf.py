@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 __author__ = ["David Cardona-Vasquez, Benjamin Stöckl"]
-__copyright__ = "Copyright 2024, Graz University of Technology"
+__copyright__ = "Copyright 2023, Graz University of Technology"
 __credits__ = ["David Cardona-Vasquez", "Benjamin Stöckl"]
 __license__ = "MIT"
-__maintainer__ = "David Cardona-Vasquez"
+__maintainer__ = "Benjamin Stöckl"
 __status__ = "Development"
 
 import data
@@ -22,26 +22,36 @@ from sys import exit
 
 
 
-def ptdfDcOpf(renewables, thermals, opf, lines, cf, demand, imports, costs, periods, ptdf, name='ptdf',
-              ramping=False, power_flow_cost=0, mult_with_Xline=False, hourly_cost=False, single_node=False,
-              activate_NSP=False, nsp_on_slack_bus=False, relax_line_limits=False):
+def ptdfDcOpf(renewables,
+              thermals,
+              opf,
+              lines,
+              cf,
+              demand,
+              imports,
+              costs,
+              periods,
+              ptdf,
+              name='ptdf',
+              warmstarting_data_dict=None,
+              ramping=False,
+              hourly_cost=False,
+              activate_NSP=False,
+              nsp_on_slack_bus=False,
+              relax_line_limits=False,
+              df_bus_info=pd.DataFrame()
+              ):
     '''
 
     model based on the transport_model, but with an implementation of the DC-OPF
 
     '''
 
-    ### CHANGE IF NEEDED
-    # select if the flow-/anglebounds should be defined by variable bounds or constraints
-    # True -> variable bounds | False -> constraints
-    useFlowBounds = True
-    useAngleBounds = True
-
     # create pyomo model
     model = pyo.ConcreteModel(name="(" + name + ")")
 
     # get dictionary with input data
-    d_data = fill_model_data_opf(renewables, thermals, opf, lines, cf, demand, imports, periods)
+    d_data = fill_model_data_opf(renewables, thermals, opf, lines, cf, demand, imports, periods, df_bus_info)
 
     # ========================== Define Parameters =====================================================================
     model.PERIODS = periods  # number of periods
@@ -78,10 +88,10 @@ def ptdfDcOpf(renewables, thermals, opf, lines, cf, demand, imports, costs, peri
     # model.vImp = pyo.Var(model.pIMP_NODE, model.pT, domain=pyo.NonNegativeReals)  # imports at each bus for each period
 
     # define network parameters
-    model.pLL = pyo.Param(model.pL, initialize=d_data['line_lim'])  # flow limits between bus
+    model.pLL = pyo.Param(model.pL, initialize=d_data['line_lim'])                  # flow limits between bus
     model.pXline = pyo.Param(model.pL, initialize=d_data['Xline'], within=pyo.Any)  # reactance of the line
-    model.pBP = pyo.Param(initialize=d_data['bpower'])  # parameter for base power
-    model.pSlackBus = pyo.Param(initialize=d_data['slckbus'], within=pyo.Any)  # parameter for slack bus
+    model.pBP = pyo.Param(initialize=d_data['bpower'])                                      # parameter for base power
+    model.pSlackBus = pyo.Param(initialize=d_data['slckbus'], within=pyo.Any)               # parameter for slack bus
     # model.pMAD = pyo.Param(initialize=d_data['maxangdiff'])
 
     model.pGB = pyo.Param(model.pG, model.pB, initialize=d_data['gb'],  # set with units connected to a bus
@@ -91,7 +101,8 @@ def ptdfDcOpf(renewables, thermals, opf, lines, cf, demand, imports, costs, peri
     model.flow_limits_bounds = pyo.Param(model.pL, initialize=d_data['line_lim'])
 
     # ========================== Define Variables ======================================================================
-    model.vGen = pyo.Var(model.pG, model.pT, domain=pyo.NonNegativeReals)  # generation from each unit at each time
+    model.vGen = pyo.Var(model.pG, model.pT, domain=pyo.NonNegativeReals,
+                         initialize=(None if warmstarting_data_dict is None else warmstarting_data_dict['vGen']))  # generation from each unit at each time
 
     if activate_NSP and nsp_on_slack_bus:
         model.vNSP = pyo.Var(model.pB, model.pT, domain=pyo.NonNegativeReals)  # non-supplied power at bus at each time
@@ -193,36 +204,15 @@ def ptdfDcOpf(renewables, thermals, opf, lines, cf, demand, imports, costs, peri
 
     model.eMinTransport = pyo.Constraint(model.pL, model.pT, rule=eMinTransport)
 
-    # ------------------- ramping constraints --------------------------------------------------------------------------
-    def eRmpUp(mdl, g, p):
-        if p == 1:
-            return pyo.Constraint.Skip
-        else:
-            return mdl.vGen[g, p] - mdl.vGen[g, p - 1] <= mdl.pRU[g]
-
-    if ramping:
-        model.eRmpUp = pyo.Constraint(model.pGT, model.pT, rule=eRmpUp)
-
-    def eRmpDn(mdl, g, p):
-        if p == mdl.PERIODS:
-            return pyo.Constraint.Skip
-        else:
-            return mdl.vGen[g, p] - mdl.vGen[g, p + 1] <= mdl.pRD[g]
-
-    if ramping:
-        model.eRmpDn = pyo.Constraint(model.pGT, model.pT, rule=eRmpDn)
-
-    # def eImport(mdl, b, p):
-    #     return mdl.vImp[b, p] <= mdl.pIMP[b, p]
-
-    # model.eImport = pyo.Constraint(model.pIMP_NODE, model.pT, rule=eImport)
 
     model.rc = pyo.Suffix(direction=pyo.Suffix.IMPORT)
     model.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
     return model
 
 
-def calculate_power_flow_original_grid(case, df_vGen, df_NSP, periods, original_case=''):
+
+def calculate_power_flow_original_grid(case, data_folder, df_vGen, periods, df_NSP, original_case='', df_vGen_agg=None,
+                                       df_vDemAdd=None):
 
     '''
 
@@ -235,42 +225,76 @@ def calculate_power_flow_original_grid(case, df_vGen, df_NSP, periods, original_
 
     '''
 
-    df_ptdf_full = pd.read_csv(os.path.join('data', (original_case if original_case != '' else case),
+    # import the PTDF matrix of the full model
+    df_ptdf_full = pd.read_csv(os.path.join(data_folder, 'data', (original_case if original_case != '' else case),
                                             'PTDF.csv'), sep=';', decimal=',')
     df_ptdf_full = df_ptdf_full.astype({'bus1': str, 'bus2': str})
     df_ptdf_full.set_index(['bus1', 'bus2'], inplace=True)
 
-    # DataFrame with original buses and unit names
-    df_orig_res = pd.read_csv(os.path.join('data', (original_case if original_case != '' else case),
+    # DataFrame with original buses and unit names for thermal & renewable units
+    df_orig_res = pd.read_csv(os.path.join(data_folder, 'data', (original_case if original_case != '' else case),
                                            'renewables.csv'), sep=';', decimal=',')[['unit', 'bus']]
-    df_orig_th = pd.read_csv(os.path.join('data', (original_case if original_case != '' else case),
+    df_orig_th = pd.read_csv(os.path.join(data_folder, 'data', (original_case if original_case != '' else case),
                                           'thermals.csv'), sep=';', decimal=',')[['unit', 'bus']]
 
-
+    # DataFrame with original buses and unit names for all generating units
     df_orig_gen = pd.concat([df_orig_res, df_orig_th], axis=0)
     df_orig_gen.set_index('unit', inplace=True)
-    df_orig_gen = df_orig_gen.astype({'bus': str})
+    df_orig_gen['bus'] = df_orig_gen['bus'].astype(int).astype(str)
+    # df_orig_gen = df_orig_gen.astype({'bus': str})
     df_orig_gen.rename(columns={'bus': 'orig_bus'}, inplace=True)
     df_vGen = df_vGen.join(df_orig_gen, on='unit', how='left')
 
     df_assign_node = df_vGen[['bus', 'orig_bus']]
 
-    df_vGen = df_vGen[['value', 'orig_bus']].groupby('orig_bus').sum()
-    df_vGen.rename(columns={'value': 'inj'}, inplace=True)
+    # get the sum of the production at each bus of the original grid
+    df_vGen.set_index(['unit', 'orig_bus'], inplace=True)
+    df_vGen = df_vGen.pivot(columns='period', values='value')
+    df_vGen.reset_index(inplace=True)
+    df_vGen.drop(columns={'unit'}, inplace=True)
+    df_vGen['orig_bus'] = df_vGen['orig_bus'].astype(int).astype(str)
+    df_vGen = df_vGen.groupby('orig_bus').sum()
 
 
 
     # get import data as df
-    import_data = load_import(original_case, ',')
-    df_import_data = data.import_data_to_df(import_data, periods)
-    df_import_data.rename(columns={1: 'inj'}, inplace=True)
+    #TODO: check if the import data is correct
 
-    orig_demand_data = load_demand(original_case, ',')
+    # import_data = load_import(original_case, ',', data_folder)
+    # df_import_data = data.import_data_to_df(import_data, periods)
+    # df_import_data.rename(columns={1: 'inj'}, inplace=True)
+
+    orig_demand_data = load_demand(original_case, ',', data_folder)
     df_dem = data.demand_dict_to_df(orig_demand_data)
-    df_dem.rename(columns={0: 'inj'}, inplace=True)
 
     df_inj = df_vGen.sub(df_dem, fill_value=0)
-    df_inj = df_inj.add(df_import_data, fill_value=0)
+    # df_inj = df_inj.add(df_import_data, fill_value=0)
+
+    # add generation of aggregated model to injection
+    if df_vGen_agg is not None:
+        df_vGen_agg['bus'] = df_vGen_agg['bus'].astype(int).astype(str)
+        df_vGen_agg_bus = df_vGen_agg.join(df_orig_gen, on='unit', how='left')
+        df_vGen_agg_bus = df_vGen_agg_bus[['period', 'value', 'unit', 'orig_bus']].set_index(['unit', 'orig_bus'])
+        df_vGen_agg_bus = df_vGen_agg_bus.pivot(columns='period', values='value')
+        df_vGen_agg_bus.reset_index(inplace=True)
+        df_vGen_agg_bus.drop(columns=['unit'], inplace=True)
+        df_vGen_agg_bus['orig_bus'] = df_vGen_agg_bus['orig_bus'].astype(int).astype(str)
+        df_vGen_agg_bus = df_vGen_agg_bus.groupby('orig_bus').sum()
+
+        df_inj = df_inj.add(df_vGen_agg_bus, fill_value=0)
+
+    # subtract additional demand to the injection, if it exists
+    if df_vDemAdd is not None:
+
+        df_vDemAdd.rename(columns={'level_0': 'unit', 'level_1': 'period', 0: 'value'}, inplace=True)
+        df_vDemAdd = df_vDemAdd.join(df_orig_gen, on='unit', how='left').set_index(['unit', 'orig_bus'])
+        df_vDemAdd = df_vDemAdd.pivot(columns='period', values='value')
+        df_vDemAdd.reset_index(inplace=True)
+        df_vDemAdd.drop(columns=['unit'], inplace=True)
+        df_vDemAdd['orig_bus'] = df_vDemAdd['orig_bus'].astype(int).astype(str)
+        df_vDemAdd = df_vDemAdd.groupby('orig_bus').sum()
+
+        df_inj = df_inj.sub(df_vDemAdd, fill_value=0)
 
     # load NSP data
     # if df_NSP is not None:
@@ -279,26 +303,18 @@ def calculate_power_flow_original_grid(case, df_vGen, df_NSP, periods, original_
 
     # add because there is no demand at this node, but there is a line to the node
 
-    if 'ATHAUSS2' in df_inj.index:
-        df_inj.loc['ITSOVE2', 'inj'] = 0
-    if 'CZSOKO1' in df_inj.index:
-        df_inj.drop(['CZSOKO1'], inplace=True)
+    # check if the sum of the injections in every period is zero
+    if (df_inj.sum().abs() > 1e-6).any():
+        exit('Power balance not fulfilled!' + str(df_inj.sum()))
 
-    if 'ATWUERM2' in df_ptdf_full.columns:
-        df_ptdf_full.drop(columns={'ATWUERM2', 'ATWUERM02'}, inplace=True)
-
-    # check if the sum of the injections is zero
-    if abs(df_inj['inj'].sum()) > 1e-6:
-        exit('Power balance not fulfilled!' + str(df_inj['inj'].sum()))
-
-    # check if for every bus a injection value ist defined
+    # check if for every bus an injection value is defined
     if len(df_inj.index) < len(df_ptdf_full.columns):
         for i in df_ptdf_full.columns:
             if i not in df_inj.index:
                 df_inj.loc[i] = 0
 
 
-    df_orig_power_flow = df_ptdf_full @ df_inj['inj']
+    df_orig_power_flow = df_ptdf_full @ df_inj
 
     return df_orig_power_flow
 
@@ -390,7 +406,7 @@ def export_model_statistics(model, case, original_case, number_of_clusters, res_
                         sep=';', decimal=',')
 
 
-def get_generation_difference(original_case, res_folder, aggregated_case='', df_vGen=pd.DataFrame(),
+def get_generation_difference(original_case, res_folder, data_folder, aggregated_case='', df_vGen=pd.DataFrame(),
                               df_gen_data=pd.DataFrame()):
 
     # get the production of the full model
@@ -404,8 +420,8 @@ def get_generation_difference(original_case, res_folder, aggregated_case='', df_
 
     if df_gen_data.empty and aggregated_case != '':
         sep_dec = ','
-        res_data = load_renewables(aggregated_case, sep_dec)
-        th_data = load_thermals(aggregated_case, sep_dec)
+        res_data = load_renewables(aggregated_case, sep_dec, data_folder)
+        th_data = load_thermals(aggregated_case, sep_dec, data_folder)
 
         df_gen_data = pd.concat([res_data, th_data], axis=0)
         df_gen_data.set_index('unit', inplace=True)
@@ -420,11 +436,11 @@ def get_generation_difference(original_case, res_folder, aggregated_case='', df_
     return df_diff_vGen, df_diff_vGen_perc, df_gen_data
 
 
-def get_generation_error(original_case, res_folder, df_gen_data=pd.DataFrame(),
+def get_generation_error(original_case, res_folder, data_folder, df_gen_data=pd.DataFrame(),
                          df_vGen=pd.DataFrame(), aggregated_case=''):
 
-    df_diff_vGen, df_diff_vGen_perc, df_gen_data = get_generation_difference(original_case, res_folder, aggregated_case,
-                                                                             df_vGen, df_gen_data)
+    df_diff_vGen, df_diff_vGen_perc, df_gen_data = get_generation_difference(original_case, res_folder, data_folder,
+                                                                             aggregated_case, df_vGen, df_gen_data)
 
     # the vGen error gets calculated by the root-mean-square of the generation differences
     # vGen_rel_error = np.sqrt(sum(df_diff_vGen_perc ** 2) / len(df_diff_vGen))
@@ -440,36 +456,45 @@ def get_generation_error(original_case, res_folder, df_gen_data=pd.DataFrame(),
     return d_vGen_error, tec_error
 
 
-def run_model(case: str, periods: int, model_type='dcOpf', basis_constraints='', power_flow_cost=0,
-              mult_with_Xline=False, ramping=True, hourly_cost=True, res_folder='results', original_case='',
-              number_of_clusters=0, activate_NSP=False, relax_line_limits=False, export_model_definition=False):
+def run_model(case: str,
+              periods: int,
+              power_flow_cost=0,
+              mult_with_Xline=False,
+              ramping=True,
+              res_folder='results',
+              data_folder='',
+              original_case='',
+              number_of_clusters=0,
+              activate_NSP=False,
+              relax_line_limits=False,
+              export_model_definition=False,
+              warmstarting_case=''
+              ):
 
     # define Input case name
     s_aux = case.split('_')
-
     input_case = case
 
     if 'basis' in s_aux:
         input_case = case
-        period_weights = pd.read_csv(os.path.join('data', input_case, 'basis_weights.csv'), sep=';', decimal=',')
+        period_weights = pd.read_csv(os.path.join(data_folder, 'data', input_case, 'basis_weights.csv'), sep=';', decimal=',')
 
     #
     # ----------------------------- Load Model Data --------------------------------------------------------------------
 
     # load data renewables, thermals, capacity factors, demand, network, line data and opf parameters
     sep_dec = ','
-    renewables_data = load_renewables(input_case, sep_dec)
-    thermals_data = load_thermals(input_case, sep_dec)
-    cf_data = load_cf(input_case, sep_dec)
-    demand_data = load_demand(input_case, sep_dec)
-    line_data = load_lines(input_case, sep_dec)
-    opf_data = load_opf_parameters(input_case, sep_dec)
-    import_data = load_import(input_case, sep_dec)
+    renewables_data = load_renewables(input_case, sep_dec, data_folder)
+    thermals_data = load_thermals(input_case, sep_dec, data_folder)
+    cf_data = load_cf(input_case, sep_dec, data_folder)
+    demand_data = load_demand(input_case, sep_dec, data_folder)
+    line_data = load_lines(input_case, sep_dec, data_folder)
+    opf_data = load_opf_parameters(input_case, sep_dec, data_folder)
+    import_data = load_import(input_case, sep_dec, data_folder)
     print('Data loaded!')
 
-    df_ptdf = pd.read_csv(os.path.join('data', input_case, 'PTDF.csv'), sep=';', decimal=',')
+    df_ptdf = pd.read_csv(os.path.join(data_folder, 'data', input_case, 'ptdf.csv'), sep=';', decimal=',')
     df_ptdf = df_ptdf.astype({'bus1': str, 'bus2': str})
-    df_ptdf = df_ptdf.round(6)
 
     ptdf = {}
 
@@ -479,22 +504,26 @@ def run_model(case: str, periods: int, model_type='dcOpf', basis_constraints='',
             ptdf[str(row['bus1']), str(row['bus2']), b] = row[b]
 
     # load generation costs and cost for non supplied power
-    folder_content = os.listdir(os.path.join('data', input_case))
+    folder_content = os.listdir(os.path.join(data_folder, 'data', input_case))
     if 'gen_costs.csv' in folder_content and 'nsp_costs.csv' in folder_content:
-        gen_costs = pd.read_csv(os.path.join('data', input_case, 'gen_costs.csv'), sep=';', decimal=sep_dec)
+        gen_costs = pd.read_csv(os.path.join(data_folder, 'data', input_case, 'gen_costs.csv'), sep=';', decimal=sep_dec)
         gen_costs.set_index('resource', inplace=True)
-        nsp_costs = pd.read_csv(os.path.join('data', input_case, 'nsp_costs.csv'), sep=';', decimal=sep_dec)
+        nsp_costs = pd.read_csv(os.path.join(data_folder, 'data', input_case, 'nsp_costs.csv'), sep=';', decimal=sep_dec)
         nsp_costs = nsp_costs.astype({'zone': 'str', 'CNSP': 'float'})
         nsp_costs.set_index('zone', inplace=True)
     elif 'gen_costs.xlsx' in folder_content and 'nsp_costs.xlsx' in folder_content:
-        gen_costs = pd.read_excel(os.path.join('data', case, 'gen_costs.xlsx'), index_col=0)
-        nsp_costs = pd.read_excel(os.path.join('data', case, 'nsp_costs.xlsx'), index_col=0)
+        gen_costs = pd.read_excel(os.path.join(data_folder, 'data', case, 'gen_costs.xlsx'), index_col=0)
+        nsp_costs = pd.read_excel(os.path.join(data_folder, 'data', case, 'nsp_costs.xlsx'), index_col=0)
     else:
         exit('Can\'t load files gen_costs.* or nsp_costs.*!')
 
     costs = {'CN': 0.1}
     costs['CNSP'] = list(nsp_costs.to_dict().items())[0][1]
     costs['CG'] = list(gen_costs.to_dict().items())[0][1]
+
+    # for warmstarting the model load the unit dispatch and the power flow in the original grid
+    warmstarting_data = get_vGen_warmstarting_data(res_folder, warmstarting_case)
+
 
     #
     # ----------------------------- Create Model -----------------------------------------------------------------------
@@ -505,14 +534,12 @@ def run_model(case: str, periods: int, model_type='dcOpf', basis_constraints='',
     # create model depending on model type (transportModel, dcOpf, augmentedDcOpf)
 
     model = ptdfDcOpf(renewables_data, thermals_data, opf_data, line_data, cf_data, demand_data, import_data,
-                         costs, periods, ptdf, case,
-                         power_flow_cost=power_flow_cost,
-                         mult_with_Xline=mult_with_Xline,
-                         ramping=ramping,
-                         hourly_cost=False,
-                         activate_NSP=activate_NSP,
-                         relax_line_limits=relax_line_limits,
-                         )
+                      costs, periods, ptdf, case, warmstarting_data,
+                      ramping=ramping,
+                      hourly_cost=False,
+                      activate_NSP=activate_NSP,
+                      relax_line_limits=relax_line_limits,
+                      )
 
     #
     # ------------------------------- Solve Model ----------------------------------------------------------------------
@@ -521,6 +548,9 @@ def run_model(case: str, periods: int, model_type='dcOpf', basis_constraints='',
     model_build_time = end - start  # time to build the model
     print('Model created in: {:.2f} seconds'.format(model_build_time))
     solver = pyo.SolverFactory('gurobi_persistent')
+
+    gurobi_solver = 'barrier'
+    solver.options['Method'] = 2
 
     if export_model_definition:
         with open(os.path.join(res_folder, case, 'model_description.txt'), 'w') as f:
@@ -563,8 +593,21 @@ def run_model(case: str, periods: int, model_type='dcOpf', basis_constraints='',
     else:
         df_vNSP = None
 
+    # export calculation time
+    export_results.export_calculation_time(res_folder, case, 'PTDF_warmstarting', model_build_time,
+                                           model_solving_time,
+                                           warmstarting_case)
+
+    df_model_stats = pd.DataFrame()
+    df_model_stats.loc[0, 'model_parameter'] = 'ofv'
+    df_model_stats.loc[0, 'parameter_value'] = pyo.value(model.obj)
+
+    # export objective function value
+    df_model_stats.to_csv(os.path.join(res_folder, case, 'model_stats.csv'), sep=';', decimal=',', index=False)
+
+
     # export vGen results
-    df_gen = export_results.extract_gen_units(input_case)
+    df_gen = export_results.extract_gen_units(input_case, data_folder)
     df_vGen = export_results.extract_vGen(model, case, df_gen)
 
     df_vGen.to_csv(os.path.join(res_folder, case, 'vGen.csv'), sep=';', decimal=',')
@@ -578,6 +621,9 @@ def run_model(case: str, periods: int, model_type='dcOpf', basis_constraints='',
     df_ptdf.set_index([df_ptdf['bus1'], df_ptdf['bus2']], inplace=True)
     df_ptdf.drop(columns=['bus1', 'bus2'], inplace=True)
     df_ptdf.sort_index(inplace=True)
+
+    # make array from df_ptdf dataframe
+    ptdf = df_ptdf.to_numpy()
 
     # --------- BEGIN Evaluate power flows in aggregated Grid and original Grid ----------------------------------------
 
@@ -605,43 +651,50 @@ def run_model(case: str, periods: int, model_type='dcOpf', basis_constraints='',
     if original_case != '':
         # calculate power flows in original model
         # ATTENTION: in the function some nodes gets dropped from the ptdf AND the inj df, because there is no demand
-        df_orig_power_flow = calculate_power_flow_original_grid(case, df_vGen, df_vNSP, periods, original_case)
+        df_orig_power_flow = calculate_power_flow_original_grid(case, data_folder, df_vGen, periods, df_vNSP,
+                                                                original_case)
         df_orig_power_flow.to_csv(os.path.join(res_folder, case, 'lineP_orig.csv'), sep=';', decimal=',')
 
         # load line limits of full grid
-        df_orig_line_limits = load_lines(original_case, sep_dec)
+        df_orig_line_limits = load_lines(original_case, sep_dec, data_folder)
         df_orig_line_limits.set_index(['bus1', 'bus2'], inplace=True)
 
-        # get the lines with violated line limits
-        df_orig_limit_violation = df_orig_power_flow.abs() >= df_orig_line_limits['Pmax']
-        l_violated_lines = df_orig_power_flow.index[df_orig_limit_violation].to_list()
-
         # calculate how much the line limits are violated
-        # calculate percentage power flow in original grid
+        # calculate relative power flow in original grid
         df_orig_power_flow_perc = df_orig_power_flow.div(df_orig_line_limits['Pmax'], axis=0)
+
         # filter lines with power flows below or above the limits
-        df_orig_power_flow_violated_limits = df_orig_power_flow_perc[(df_orig_power_flow_perc > 1) | (df_orig_power_flow_perc < -1)]
+        df_orig_power_flow_violated_limits = df_orig_power_flow_perc[(df_orig_power_flow_perc > 1) |
+                                                                     (df_orig_power_flow_perc < -1)]
+
+        # get the lines with violated line limits
+        df_orig_limit_violation = df_orig_power_flow_perc.abs() >= 1
+        l_violated_lines = df_orig_power_flow.index[df_orig_limit_violation.any(axis=1)].to_list()
+        print('\nLines with violated line limits:' + str(l_violated_lines) + '\n')
 
         # calculate the percentage how much the line limits are violated
         df_orig_power_flow_violated_limits = df_orig_power_flow_violated_limits.abs() - 1
+        ll_violation_error_max = df_orig_power_flow_violated_limits.max().max()
 
-        ll_violation_error_max = df_orig_power_flow_violated_limits.max()
 
         # calculate difference to original power flow with an error metric!
         df_orig_case_power_flow = pd.read_csv(os.path.join(res_folder, original_case, 'lineP.csv'),
                                               sep=';', decimal=',', header=[0, 1])
+        df_orig_case_power_flow.index = range(1, periods + 1)
+        df_orig_case_power_flow.index.name = 'period'
         df_orig_case_power_flow = df_orig_case_power_flow.T
+        df_orig_case_power_flow.index.names = ['bus1', 'bus2']
 
-        df_diff_power_flow = df_orig_power_flow - df_orig_case_power_flow.squeeze()
-        df_diff_power_flow_perc = df_diff_power_flow / df_orig_line_limits['Pmax']
-        # the flow error gets calculated by the root-mean-square of the flow differences
-        # flow_error = np.sqrt(sum(df_diff_power_flow ** 2) / len(df_diff_power_flow))
+        df_diff_power_flow = df_orig_power_flow - df_orig_case_power_flow
+        df_diff_power_flow_perc = df_diff_power_flow.div(df_orig_line_limits['Pmax'], axis=0)
 
-        flow_rel_error = sum(df_diff_power_flow_perc.abs()) / len(df_diff_power_flow_perc)
-        flow_rel_error_max_dev = max(abs(df_diff_power_flow_perc))  # maximum deviation of power flow in aggregated and original
+        # flow_rel_error = sum(df_diff_power_flow_perc.abs()) / len(df_diff_power_flow_perc)
+        flow_rel_error = (df_diff_power_flow_perc.abs().sum().sum() / df_diff_power_flow_perc.size)
+        flow_rel_error_max_dev = df_diff_power_flow_perc.abs().max().max()  # maximum deviation of power flow in aggregated and original
 
         # calculate difference in flows between original and aggregated model for the congested lines
-        df_om_power_flow_perc = pd.read_csv(os.path.join(res_folder, original_case, 'lineP_perc.csv'), sep=';', decimal=',', header=[0,1])
+        df_om_power_flow_perc = pd.read_csv(os.path.join(res_folder, original_case, 'lineP_perc.csv'),
+                                            sep=';', decimal=',', header=[0, 1])
         df_om_power_flow_perc = df_om_power_flow_perc.T
 
 
@@ -656,45 +709,46 @@ def run_model(case: str, periods: int, model_type='dcOpf', basis_constraints='',
         df_gen_data = pd.concat([renewables_data, thermals_data], axis=0)
         df_gen_data.set_index('unit', inplace=True)
 
-        d_vGen_error, tec_error = get_generation_error(original_case, res_folder, df_gen_data=df_gen_data, df_vGen=df_vGen)
-
-    # --------- END Evaluate production in aggregated grid and original Grid ------------------------------------------
-    # --------- BEGIN export aggregation statistics --------------------------------------------------------------------
-
-    if original_case != '':
+        # calculate error of generation values
+        d_vGen_error, tec_error = get_generation_error(original_case, res_folder, data_folder, df_gen_data=df_gen_data,
+                                                       df_vGen=df_vGen)
+        # export model statistics
         export_model_statistics(model, case, original_case, number_of_clusters, res_folder, d_flow_error, d_vGen_error,
-                                tec_error, l_violated_lines)
-
-    # --------- END export aggregation statistics -----------------
+                            tec_error, l_violated_lines)
+    # --------- END Evaluate production in aggregated grid and original Grid ------------------------------------------
 
 
     return {}
 
 
 if __name__ == '__main__':
+
+    all_number_of_clusters = False
     periods = 1
-    number_of_clusters = 5
-
-    clustering_method = 'lmps'
-
+    number_of_clusters = -1
+    tec_type = 'tecAss'
+    clustering_method = 'lmpAnacPTDF'
     orig_case = 'IEEE_24_p19'
-    case = 'IEEE_24_p19_red_' + clustering_method + '_' + str(number_of_clusters) + '_tecAss'
 
-    '''
-    For large scenarios define file path outside of the git repo, because files with sizes bigger than 100 MB
+
+    ''' 
+    For large scenarios define file path outside of the git repo, because files with sizes bigger than 100 MB 
     are not uploaded!!
     '''
-    results_folder = os.path.join('.', 'results')
+    results_folder = os.path.join('..', '..', 'GridAggregation', 'results')
+    data_folder = os.path.join('..', '..', 'GridAggregation')
 
-    gla.check_if_folder_exists_and_create(results_folder, scenario_folder=case)
-    print('run agg model: ', results_folder, orig_case, str(number_of_clusters))
+    case = f'{orig_case}_red_{clustering_method}_{number_of_clusters}_{tec_type}'
+
+    gla.check_if_folder_exists_and_create(results_folder, folder=case)
+    print('run agg model: ', results_folder, str(number_of_clusters))
 
     results = run_model(case, periods,
-              model_type='ptdfDcOpf',
-              res_folder=results_folder,
-              original_case=orig_case,
-              number_of_clusters=number_of_clusters,
-              activate_NSP=False,
-              ramping=False,
-              relax_line_limits=False,
+                        res_folder=results_folder,
+                        data_folder=data_folder,
+                        original_case=orig_case,
+                        number_of_clusters=number_of_clusters,
+                        activate_NSP=False,
+                        ramping=False,
+                        relax_line_limits=False,
                         )

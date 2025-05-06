@@ -1,17 +1,45 @@
 #!interpreter [optional-arg]
 # -*- coding: utf-8 -*-
 
-__author__ = ["David Cardona-Vasquez"]
+__author__ = ["David Cardona-Vasquez", "Benjamin Stöckl"]
 __copyright__ = "Copyright 2023, Graz University of Technology"
-__credits__ = ["David Cardona-Vasquez"]
+__credits__ = ["David Cardona-Vasquez", "Benjamin Stöckl"]
 __license__ = "MIT"
-__maintainer__ = "David Cardona-Vasquez"
+__maintainer__ = "Benjamin Stöckl"
 __status__ = "Development"
 
 import glob
 import numpy as np
 import os
 import pandas as pd
+import shutil
+from natsort import natsorted
+
+
+
+def get_vGen_warmstarting_data(results_folder: str, warmstarting_case: str):
+    """
+    Load generation results from aggregated model results for warmstarting the full model
+
+    :param res_folder:
+    :param warmstarting_case:
+    :return: aggregated_unit_generation_dict: dict in format {(unit, period): generation}
+    """
+
+    if warmstarting_case == '':
+        return None
+    else:
+        # load generation results from aggregated model
+        aggregated_unit_generation = pd.read_csv(os.path.join(results_folder, warmstarting_case, 'vGen.csv'), sep=';',
+                                                 decimal=',', index_col='unit')
+        aggregated_unit_generation.drop(columns={'bus', 'type'}, inplace=True)
+
+        # create dict with generation results from dataframe in format {(unit, period): generation}
+        aggregated_unit_generation_dict = {}
+        for i, row in aggregated_unit_generation.iterrows():
+            aggregated_unit_generation_dict[(i, row['period'])] = row['value']
+
+        return {'vGen': aggregated_unit_generation_dict}
 
 
 def load_cf(case: str, decimal='.', folder=""):
@@ -88,20 +116,7 @@ def load_lines(case: str, decimal='.', folder=""):
     return line_data
 
 
-def load_network(case: str, decimal='.', folder=""):
-    """
-
-    :param case:
-    :return:
-    """
-
-    network_data = pd.read_csv(os.path.join(folder, 'data', case, 'network.csv'), sep=';', decimal=decimal)
-    network_data.fillna(value=0, inplace=True)
-
-    return network_data
-
-
-def load_opf_parameters(case: str,decimal='.', folder=""):
+def load_opf_parameters(case: str, decimal='.', folder=""):
     """
 
     :param case:
@@ -151,14 +166,31 @@ def load_thermals(case: str, decimal='.', folder=""):
     return thermals_data
 
 
-def __matrix_to_dict__(df: pd.DataFrame):
-    d = {}
+def load_ptdf(case: str, decimal='.', folder=''):
 
-    for i, row in df.iterrows():
-        for c in row.index[1:]:
-            d[row.iloc[0], c] = row[c]
+    ptdf = pd.read_csv(os.path.join(folder, 'data', case, 'ptdf.csv'), sep=';', decimal=decimal)
+    ptdf = ptdf.astype({'bus1': 'str', 'bus2': 'str'})
+    ptdf.set_index(['bus1', 'bus2'], inplace=True)
 
-    return d
+    # sort ptdf by natsorted indices
+    ptdf = ptdf.reindex(natsorted(ptdf.index))
+
+    #reorder columns by natsorted columns
+    ptdf = ptdf[natsorted(ptdf.columns)]
+
+    return ptdf
+
+
+def load_opf_parameter(case: str, parameter: str, decimal='.', folder=""):
+
+    df_opf_parameters = pd.read_csv(os.path.join(folder, 'data', case, 'opf_parameters.csv'), sep=';', decimal=',')
+
+    if parameter == 'SlackBus':
+        value = str(df_opf_parameters.loc[df_opf_parameters['parameter_name'] == parameter, 'parameter_value'].values[0])
+    else:
+        value = df_opf_parameters.loc[df_opf_parameters['parameter_name'] == parameter, 'parameter_value'].values[0]
+
+    return value
 
 
 def __lines_to_dict__(df: pd.DataFrame):
@@ -185,6 +217,176 @@ def __buses_from_lines__(df: pd.DataFrame):
     return d
 
 
+def export_cf(generator: str, cf: pd.DataFrame, case: str, decimal='.', folder=""):
+    """
+
+    :param generator:
+    :param cf:
+    :param case:
+    :return:
+    """
+
+    cf.to_csv(os.path.join(folder, 'data', case, 'cf', f'{generator}.csv'), sep=';', decimal=decimal, index=False)
+
+    return None
+
+
+def export_demand(bus: str, demand: pd.DataFrame, case: str, decimal='.', folder=""):
+    """
+
+    :param bus:
+    :param demand:
+    :param case:
+    :return:
+    """
+
+    demand.to_csv(os.path.join(folder, 'data', case, 'loads', f'{bus}.csv'), sep=';', decimal=decimal, index=False)
+
+    return None
+
+
+def export_additional_demand(df_vDemAdd, case, folder=""):
+
+    """
+    Export additional demand data to csv file
+
+    :param df_vDemAdd:
+    :param case:
+    :param res_folder:
+    :return:
+    """
+
+    # export additional demand data
+    df_vDemAdd.to_csv(os.path.join(folder, case, 'vDemAdd.csv'), sep=';', decimal=',', index=False)
+
+    return None
+
+
+def export_lines(lines: pd.DataFrame, case: str, decimal='.', folder=""):
+    """
+
+    :param lines:
+    :param case:
+    :return:
+    """
+    if list(lines.index.names) != ['bus1', 'bus2']:
+        lines.set_index(['bus1', 'bus2'], inplace=True)
+
+    # sort lines by natsorted indices
+    lines = lines.reindex(natsorted(lines.index))
+
+    #reorder columns by natsorted columns
+    lines = lines[natsorted(lines.columns)]
+
+    lines.to_csv(os.path.join(folder, 'data', case, 'lines.csv'), sep=';', decimal=decimal, index=True)
+
+    return None
+
+
+def export_network(network: pd.DataFrame, case: str, decimal='.'):
+    """
+
+    :param network:
+    :param case:
+    :return:
+    """
+
+    network.to_csv(os.path.join('data', case, 'network.csv'), sep=';', decimal=decimal, index=False)
+
+    return None
+
+
+def export_renewables(renewables: pd.DataFrame, case: str, decimal='.'):
+    """
+
+    :param renewables:
+    :param case:
+    :return:
+    """
+
+    renewables.to_csv(os.path.join('data', case, 'renewables.csv'), sep=';', decimal=decimal, index=False)
+
+    return None
+
+
+def export_thermals(thermals: pd.DataFrame, case: str, decimal='.'):
+    """
+
+    :param thermals:
+    :param case:
+    :return:
+    """
+
+    thermals.to_csv(os.path.join('data', case, 'thermals.csv'), sep=';', decimal=decimal, index=False)
+
+    return None
+
+
+def export_incidence_matrix(C, case, decimal='.', folder=''):
+
+    # sort C by natsorted indices
+    C = C.reindex(natsorted(C.index))
+
+    # reorder columns by natsorted columns
+    C = C[natsorted(C.columns)]
+
+    # export C_red
+    C.to_csv(os.path.join(folder, 'data', case, 'C_sb_adj.csv'), decimal=decimal, index=False, header=False, sep=';')
+
+    return
+
+
+def export_line_incidence(line_incidence: pd.DataFrame, case: str, decimal='.', folder=""):
+    """
+
+    :param line_incidence:
+    :param case:
+    :return:
+    """
+
+    # sort lines by natsorted indices
+    line_incidence = line_incidence.reindex(natsorted(line_incidence.index))
+
+    #reorder columns by natsorted columns
+    line_incidence = line_incidence[natsorted(line_incidence.columns)]
+
+    line_incidence.to_csv(os.path.join(folder, 'data', case, 'line_incidence.csv'), sep=';', decimal=decimal, index=True)
+
+    return None
+
+
+def export_ptdf(ptdf: pd.DataFrame(), case: str, decimal='.', folder='', ptdf_file_name='ptdf', slack_bus=''):
+
+    """
+
+    :param ptdf:
+    :param case:
+    :param decimal:
+    :param folder:
+    :param ptdf_file_name: file name without extension
+    :return:
+    """
+
+    # ptdf.index = ptdf.index.astype(str)
+    ptdf.columns = ptdf.columns.astype(str)
+
+    # sort ptdf by natsorted indices
+    ptdf = ptdf.reindex(natsorted(ptdf.index))
+
+    #reorder columns by natsorted columns
+    ptdf = ptdf[natsorted(ptdf.columns)]
+
+    # export ptdf
+    ptdf.to_csv(os.path.join(folder, 'data', case, ptdf_file_name + '.csv'), decimal=decimal, sep=';', index=True)
+    ptdf.to_csv(os.path.join(folder, 'data', case, ptdf_file_name + '_wo_indices.csv'), header=False, decimal=decimal, sep=';', index=False)
+
+    if slack_bus != '':
+        ptdf.drop([slack_bus], axis=1, inplace=True)
+        ptdf.to_csv(os.path.join(folder, 'data', case, ptdf_file_name + '_sb_adj.csv'), header=False, decimal=decimal, sep=';', index=False)
+
+    return
+
+
 def demand_dict_to_df(demand_data: dict):
 
     dataframes = []
@@ -193,6 +395,7 @@ def demand_dict_to_df(demand_data: dict):
         df = pd.DataFrame(data={aux_b: i['demand']['load'].values})
         dataframes.append(df)
     df = pd.concat(dataframes, axis=1).T
+    df.columns = demand_data[0]['demand']['hour'].values
 
     return df
 
@@ -221,26 +424,122 @@ def import_data_to_df(imports, periods):
     return aux_imp_data
 
 
-def fill_model_data_opf(renewables, thermals, opf, lines, cf, demand, imports, periods):
+def perturb_data(df: pd.DataFrame, column:str, n_std: float = 1, trunc=True, min_val=0, max_val= np.Inf) -> pd.DataFrame:
+
+    df_aux = df.copy()
+    df_aux[column] = df_aux[column].astype('float64')
+    std = df_aux[column].std()
+    idx_perturb = (df_aux[column] != 0) & (df_aux[column] != 1)
+    rnd = np.random.uniform(-std*n_std, std*n_std, len(df_aux.loc[idx_perturb, column]))
+    df_aux.loc[idx_perturb, column] = (df_aux.loc[idx_perturb, column] + rnd)
+
+    if df_aux[column].min() < 0:
+        print('Negative values for variable', column)
+
+    idx_perturb_min = (df_aux[column] < min_val) & idx_perturb
+    df_aux.loc[idx_perturb_min, column] = min_val
+    idx_perturb_max = (df_aux[column] > max_val) & idx_perturb
+    df_aux.loc[idx_perturb_max, column] = max_val
+
+    df_aux.loc[idx_perturb, column] = df_aux.loc[idx_perturb, column].round(2)
+    if trunc:
+        df_aux.loc[:, column] = df_aux.loc[:, column].round(0)
+
+
+    return df_aux
+
+
+def perturb_demand(df: pd.DataFrame, n_std: float = 0.2, trunc=True, min_val=0, max_val= np.Inf):
+
+    # group by demand by hour (index)
+    df_aux = df.copy()
+    df_aux['load'] = df_aux['load'].astype('float64')
+    df_aux['day'] = (df_aux['hour']-1) // 24 + 1
+
+    df_day_dem = df_aux.groupby(by='day').agg({'load': 'sum'}).reset_index()
+    df_day_dem.rename(columns={'load': 'day_load'}, inplace=True)
+    df_day_dem['day_load_pert'] = perturb_data(df_day_dem, 'day_load', n_std, trunc, min_val, max_val)['day_load']
+
+
+    df_aux_2 = pd.merge(df_aux, df_day_dem, on='day', how='left')
+    df_aux_2['load_pert'] = (df_aux_2['load'] / df_aux_2['day_load']) * df_aux_2['day_load_pert']
+
+    df_aux_2['load_pert'] = df_aux_2['load_pert'].round(0)
+    df_aux['load'] = df_aux_2['load_pert']
+    df_aux.drop(columns=['day'], inplace=True)
+
+    if df_aux.load.min() < 0:
+        print('Negative demand values')
+
+    return df_aux
+
+
+def create_scenario(case: str, base_case: str, n_std_cf: float = 1, n_std_dem: float = 0.2, decimal='.'):
+    """
+
+    :param case:
+    :param base_case:
+    :param n_std:
+    :param trunc:
+    :param min_val:
+    :param max_val:
+    :return:
+    """
+
+    # check if the case does not exist
+    if not os.path.exists(os.path.join('data', case)):
+        os.mkdir(os.path.join('data', case))
+        os.mkdir(os.path.join('data', case, 'cf'))
+        os.mkdir(os.path.join('data', case, 'loads'))
+    else:
+        # print a warning
+        print(f'Case {case} already exists. Overwriting data...')
+
+
+    files = ['renewables.csv', 'thermals.csv', 'network.csv', 'lines.csv', 'gen_costs.xlsx', 'nsp_costs.xlsx']
+    for f in files:
+        shutil.copyfile(os.path.join('data', base_case, f), os.path.join('data', case, f))
+
+
+    cf_data = load_cf(base_case, decimal)
+    demand_data = load_demand(base_case, decimal)
+
+
+    for i in cf_data:
+        i['cf'] = perturb_data(i['cf'], 'cf', n_std_cf, False, 0, 1)
+
+    for i in demand_data:
+        i['demand'] = perturb_demand(i['demand'], n_std_dem, True, 0, np.Inf)
+
+    for i in cf_data:
+        export_cf(i['generator'], i['cf'], case)
+    for i in demand_data:
+        export_demand(i['bus'], i['demand'], case)
+
+    return None
+
+
+def fill_model_data_opf(renewables, thermals, opf, lines, cf, demand, imports, periods, bus_info=pd.DataFrame()):
     l_renewable_gen = renewables.loc[:, 'unit'].to_list()
     l_thermal_gen = thermals.loc[:, 'unit'].to_list()
     l_gen = l_renewable_gen.copy()
     l_gen.extend(l_thermal_gen)
 
-    l_bus = __buses_from_lines__(lines)
+    # l_bus = __buses_from_lines__(lines)
+
+    # alternative: get buses from bus_info:
+    if bus_info.empty:
+        l_bus = __buses_from_lines__(lines)
+    else:
+        l_bus = bus_info.loc[:, 'bus'].to_list()
+
+
     d_line_power, d_line_react = __lines_to_dict__(lines)
 
     # create df for cf
-    #aux_cf_data = pd.DataFrame(data={'period': list(range(1, periods+1))})
     print(periods)
     d_cf = {}
 
-    # alt -----------------------------------------------------------------
-    # for i in cf:
-    #     aux_g = i['generator']
-    #     aux_cf_data[aux_g] = i['cf']['cf'].values
-
-    # neu -----------------------------------------------------------------
     dataframes = [pd.DataFrame(data={'period': list(range(1, periods + 1))})]
 
     for i in cf:
@@ -250,7 +549,6 @@ def fill_model_data_opf(renewables, thermals, opf, lines, cf, demand, imports, p
 
     aux_cf_data = pd.concat(dataframes, axis=1)
 
-    # ENDE neu -----------------------------------------------------------------
 
     for i, row in aux_cf_data.iterrows():
         for c in row.index[1:]:
@@ -344,6 +642,8 @@ def fill_model_data_opf(renewables, thermals, opf, lines, cf, demand, imports, p
     }
 
     return data
+
+
 
 
 

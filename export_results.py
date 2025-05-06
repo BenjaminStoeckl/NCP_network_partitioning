@@ -52,10 +52,10 @@ def extract_vNSP(mdl: ConcreteModel):
     return df_vNSP
 
 
-def extract_gen_units(case: str):
+def extract_gen_units(case: str, folder=""):
 
-    renewables_data = data.load_renewables(case, decimal=',')
-    thermals_data = data.load_thermals(case, decimal=',')
+    renewables_data = data.load_renewables(case, ',', folder)
+    thermals_data = data.load_thermals(case, ',', folder)
 
     renewables_data = renewables_data[['unit', 'bus', 'type']]
     thermals_data = thermals_data[['unit', 'bus']]
@@ -133,6 +133,7 @@ def export_line_flow(pyo_model, case_name, folder=""):
 
     df_cong_lines = df_lineP_perc[((df_lineP_perc == 1) | (df_lineP_perc == -1))]
     df_cong_lines = df_cong_lines.abs().sum(axis=0).astype(int)
+    df_cong_lines.index.names = ('bus1', 'bus2')
     df_cong_lines.to_csv(os.path.join(folder, case_name, 'congested_lines.csv'), sep=';', decimal=',')
 
     if df_cong_lines.sum() == 0:
@@ -176,6 +177,20 @@ def export_line_flow_augmented(model, case, folder):
         pass
 
     return None
+
+
+def export_calculation_time(res_folder: str, case: str, model_type: str, model_build_time: float,
+                            model_solving_time: float, case_property: str):
+
+    # export calculation time
+    if os.path.exists(os.path.join(res_folder, case, 'calc_time_'+model_type+'.csv')):
+        df_calc_time = pd.read_csv(os.path.join(res_folder, case, 'calc_time_'+model_type+'.csv'), sep=';', decimal=',')
+    else:
+        df_calc_time = pd.DataFrame()
+    df_calc_time['time_def'] = ['model_build', 'model_solving', 'total']
+    df_calc_time[case_property] = [model_build_time, model_solving_time, model_build_time + model_solving_time]
+
+    df_calc_time.to_csv(os.path.join(res_folder, case, 'calc_time_'+model_type+'.csv'), sep=';', decimal=',', index=False)
 
 
 def extract_duals(pyo_model):

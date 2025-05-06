@@ -2,21 +2,23 @@
 # -*- coding: utf-8 -*-
 
 __author__ = ["Benjamin Stöckl"]
-__copyright__ = "Copyright 2025, Graz University of Technology"
+__copyright__ = "Copyright 2023, Graz University of Technology"
 __credits__ = ["Benjamin Stöckl"]
 __license__ = "MIT"
 __maintainer__ = "Benjamin Stöckl"
 __status__ = "Development"
 
-
 import pandas as pd
 import numpy as np
 import os
+import data
 import gen_load_aggregation as gla
-import evaluation as eva
+import grid_partitioning as gp
 import time
 import scipy.spatial.distance as ssd
+from natsort import natsorted
 import warnings
+
 warnings.filterwarnings('ignore')
 
 
@@ -29,6 +31,11 @@ def get_adjacency_matrix(df_adj_parameter: pd.DataFrame):
     returns a pandas DataFrame with the adjacency matrix with size (NxN)
     '''
 
+    # get adjacency matrix of lmp differences
+
+    # lmp_diff = df_lmp_diff.to_numpy()[:, 0]
+    # adjacency_matrix = lmp_diff[:, np.newaxis] - lmp_diff[np.newaxis, :]
+
     adj_mat = ssd.pdist(df_adj_parameter.to_numpy(), 'euclidean')
     adj_mat = ssd.squareform(adj_mat)
 
@@ -37,31 +44,26 @@ def get_adjacency_matrix(df_adj_parameter: pd.DataFrame):
     return df_adjacency_matrix
 
 
-def iterative_clustering(case_folder, res_path, tec_type='tecAss', cluster_by='itCluster', l_number_of_clusters=[1]):
+def iterative_clustering(case_folder: str,
+                         res_path: str,
+                         data_folder: str,
+                         tec_type='tecAss',
+                         cluster_by='itCluster',
+                         l_number_of_clusters=[-1]
+                         ):
 
+    """
 
-    def update_bus_info(df_cluster, df_bi):
+    Note:
 
-        '''
-        Define "Old Cluster" as new buses and add new buses
-        '''
-
-        # only define new buses if clusters defined in df_bus_info
-        if 'cluster' in df_bi.columns:
-            #TODO: Add weighting of the coordinates (long term)
-
-            # df_cluster.reset_index(drop=False, inplace=True)
-
-            for i, row in df_bi.iterrows():
-                row['cluster'] = df_cluster.loc[row['cluster'], 'cluster']
-
-
-        else:
-            # if no defined clusters are in bus info, only add clusters to df
-            df_bi = df_bi.join(df_cluster, how="left")
-
-        return df_bi
-
+    :param case_folder: name of case folder
+    :param res_path:    path to results folder
+    :param data_folder: name of data folder
+    :param tec_type:    definition of assigning generators or aggregating
+    :param cluster_by:  define clustering algorithm
+    :param l_number_of_clusters: list of number of clusters
+    :return:
+    """
 
     def update_cluster_info(df_cluster, df_ci):
 
@@ -74,10 +76,15 @@ def iterative_clustering(case_folder, res_path, tec_type='tecAss', cluster_by='i
 
             df_ci.rename(columns={'cluster': 'OldCluster'}, inplace=True)
 
-            for i, row in df_ci.copy().iterrows():
-                df_ci.loc[i, 'cluster'] = str(int(df_cluster.loc[row['OldCluster'], 'cluster']))
+            if df_ci.index.dtype != object:
+                df_ci.index = df_ci.index.astype(str)
 
-            df_ci['cluster'] = df_ci['cluster'].astype(int)
+            for i, row in df_ci.copy().iterrows():
+                try:
+                    df_ci.loc[i, 'cluster'] = str(int(df_cluster.loc[row['OldCluster'], 'cluster']))
+                except:
+                    breakpoint()
+            # df_ci['cluster'] = df_ci['cluster'].astype(int)
 
             df_ci.drop(columns='OldCluster', inplace=True)
 
@@ -88,246 +95,200 @@ def iterative_clustering(case_folder, res_path, tec_type='tecAss', cluster_by='i
         return df_ci
 
 
+    def define_node_cluster(distance_metric: pd.DataFrame, node1: str, node2: str):
+
+        # create df_node_cluster and initialize with individual cluster at each node 1...len(num_of_nodes)
+        df_node_cluster = pd.DataFrame([str(i) for i in range(1, len(distance_metric) + 1)],
+                                       index=distance_metric.index, columns=['cluster'])
+        df_node_cluster.index = df_node_cluster.index.astype(str)
+
+        # don't change the cluster of the nodes 'node1' and 'node2' if the number of clusters is the same as the number of nodes
+        if number_of_clusters == len(distance_metric_sum):
+            pass
+        else:
+            # assign every node an individual cluster except the nodes 'node1' and 'node2'
+            cluster_counter = 2
+            for idx, row in df_node_cluster.iterrows():
+                if idx == node1:
+                    df_node_cluster.loc[idx, 'cluster'] = 1
+                elif idx == node2:
+                    df_node_cluster.loc[idx, 'cluster'] = 1
+                else:
+                    df_node_cluster.loc[idx, 'cluster'] = cluster_counter
+                    cluster_counter = cluster_counter + 1
+
+        return df_node_cluster
+
+
 
 # BEGIN MAIN iterative_clustering --------------------------------------------------------------------------------------
 
+    if l_number_of_clusters == [-1]:
+        exit('Please define a list of number of clusters for adjacent node agglomerative clustering.')
+
     # load input data & data from model run
-    duals, lines, df_ptdf, ptdf, df_incidence_matrix = eva.load_data(res_path, case_folder)
-    lines.drop(columns=['line', 'Xline', 'Country'], inplace=True)
+    duals, lines, df_ptdf, df_incidence_matrix_full = gp.load_data(res_path, case_folder, data_folder)
+
+    for column in ['Xline', 'line', 'Country']:
+        if column in lines.columns:
+            lines.drop(columns=column, inplace=True)
 
     # get vectors for duals
-    df_phi_upper, phi_upper = eva.get_duals_as_vector(duals, 'eMaxTransport')
-    df_phi_lower, phi_lower = eva.get_duals_as_vector(duals, 'eMinTransport')
+    df_phi_upper, phi_upper = gp.get_duals_as_vector(duals, 'eMaxTransport')
+    df_phi_lower, phi_lower = gp.get_duals_as_vector(duals, 'eMinTransport')
 
-    if 'LMP' in cluster_by:
+    if 'lmp' in cluster_by:
 
-        # get difference of lmps to slack bus for initial clustering
-        df_lmp_diff = df_ptdf.T @ (df_phi_upper - df_phi_lower)
+        distance_metric = df_ptdf.T @ (df_phi_upper - df_phi_lower)  # get difference of lmps to slack bus for initial clustering
+        distance_metric = distance_metric.reindex(natsorted(distance_metric.index))
 
-    elif 'NCI' in cluster_by:
+    elif 'ncp' in cluster_by:
 
-        df_nci = eva.get_node_cluster_information_matrix(df_ptdf, df_phi_upper, df_phi_lower).T
-        df_lmp_diff = df_nci
+        distance_metric = gp.get_network_congestion_price_matrix(df_ptdf, df_phi_upper, df_phi_lower)
+        distance_metric.columns = pd.RangeIndex(distance_metric.columns.size)  # rest columns to avoid errors with MultiIndex
+        distance_metric.reindex(natsorted(distance_metric.index))
 
     else:
         exit('No valid cluster_by parameter given. Please choose between "LMP" and "NCI".')
 
+    if distance_metric.index.dtype != object:
+        breakpoint()
 
     # define df for sum of differences
-    df_lmp_diff_sum = df_lmp_diff
-    df_lmp_diff_sum['counter'] = 1
+    distance_metric_sum = distance_metric
+    distance_metric_sum['counter'] = 1
 
-    # INDEX OF df_lmp_diff MUST HAVE NODES
-# ===================== POSSIBLE BEGIN FOR FOR LOOP =====================
+    # INDEX OF distance_metric MUST HAVE NODES
+    number_of_clusters = len(distance_metric)
 
-    orig_case = case_folder
-
-    loop_counter = 0
-    number_of_clusters = len(df_lmp_diff)
-
-    # load bus info data and set bus to index
-    df_bus_info = pd.read_csv(os.path.join('data', case_folder, 'bus_info.csv'), sep=";", decimal=",")
-    df_bus_info.drop(columns={'Country', 'BaseVolt', 'Name', 'cluster'}, inplace=True)
+    df_bus_info = pd.read_csv(os.path.join(data_folder, 'data', case_folder, 'bus_info.csv'), sep=";", decimal=",")
+    df_bus_info.drop(columns={'cluster'}, inplace=True)
     df_bus_info.set_index('bus', inplace=True)
 
     df_cluster_info = df_bus_info.copy()
     df_cluster_info.index = df_cluster_info.index.astype(str)
+    df_incidence_matrix = df_incidence_matrix_full.copy()
+    df_node_inc_matrix = df_incidence_matrix.T @ df_incidence_matrix
 
-    loop_cluster = True
+    # load slack bus from original case
+    slack_bus_original_grid = data.load_opf_parameter(case_folder, 'SlackBus', ',', data_folder)
 
-    while number_of_clusters > min(l_number_of_clusters):
+    start = time.time()
+    while number_of_clusters >= min(l_number_of_clusters):  # and number_of_clusters > 1:
 
-        start = time.time()
-        df_adjacency_matrix = get_adjacency_matrix(df_lmp_diff)
+        # get the adjacency matrix of the lmp differences
+        df_adjacency_matrix = get_adjacency_matrix(distance_metric)
 
-        # calculate incidence matrix on nodal basis
-        df_node_inc_matrix = df_incidence_matrix.T @ df_incidence_matrix
+        # check if df_node_inc_matrix and distance_metric have the same index and columns
+        if (df_node_inc_matrix.index != distance_metric.index).all() or (df_node_inc_matrix.columns != distance_metric.index).all():
+           exit('df_node_inc_matrix and distance_metric have different indices or columns. Please check the input data.')
+
+        # make a copy of the node incidence matrix to get the unweighted version
+        df_node_inc_matrix_unweighted = df_node_inc_matrix.copy()
 
         # fill diagonal of node incidence matrix with 0
         node_inc_matrix = df_node_inc_matrix.to_numpy()
         np.fill_diagonal(node_inc_matrix, 0)
+        df_node_inc_matrix = pd.DataFrame(node_inc_matrix, index=distance_metric.index, columns=distance_metric.index).abs()
 
-        df_node_inc_matrix = pd.DataFrame(node_inc_matrix, index=df_lmp_diff.index, columns=df_lmp_diff.index).abs()
-        df_node_inc_matrix = df_node_inc_matrix.replace(0, 100)  # replace entries with no connection with 100 to avoid clustering
+        # replace 0 values with high value to avoid clustering and replace connected nodes (1) with 0
+        df_node_inc_matrix = df_node_inc_matrix.replace(0, df_adjacency_matrix.max().max()*2)  # replace entries with no connection with 100 to avoid clustering
         df_node_inc_matrix = df_node_inc_matrix.replace(1, 0)  # replace entries with connection with 0
 
         # add both matrices to get a combined matrix
         df_weighted_adj_matrix = df_adjacency_matrix.abs() + df_node_inc_matrix
-
         dist_matrix = df_weighted_adj_matrix.to_numpy()
-        np.fill_diagonal(dist_matrix, 1000)
-        df_dist_matrix = pd.DataFrame(dist_matrix, index=df_lmp_diff.index, columns=df_lmp_diff.index)
+        np.fill_diagonal(dist_matrix, dist_matrix.max().max() * 2)  # set diagonal to value bigger than max to avoid combining same nodes
 
+        # get index of minimum value and corresponding indices in dataframe
         min_index_flat = np.argmin(dist_matrix)  # index of min value for one dimensional array
         min_index = np.unravel_index(min_index_flat, dist_matrix.shape)  # index of min value for two dimensional array with dimensions of dist_matrix
 
         # get corresponding node indices
-        node1 = df_lmp_diff.index[min_index[0]]
-        node2 = df_lmp_diff.index[min_index[1]]
+        node1 = distance_metric.index[min_index[0]]
+        node2 = distance_metric.index[min_index[1]]
 
-        end = time.time()
-        print('Time to identify nodes: ' + str(end - start))
+        # define df_node_cluster
+        df_node_cluster = define_node_cluster(distance_metric, node1, node2)
 
-        print('Iteration: ' + str(loop_counter) + ', Cluster Nodes: ' + str(node1) + ' and ' + str(node2))
-
-        loop_counter_1 = loop_counter
-        num_of_nodes_1 = ptdf.shape[1]
-        number_of_clusters = len(df_lmp_diff) - 1
-
-        start = time.time()
-
-        # create df_node_cluster and initialize with individual cluster at each node 1...len(num_of_nodes)
-        df_node_cluster = pd.DataFrame([0 for i in range(0, len(df_lmp_diff))], index=df_lmp_diff.index, columns=['cluster'])
-
-
-        # assign every node an individual cluster except the nodes 'node1' and 'node2'
-        cluster_counter = 2
-        for i, row in df_node_cluster.iterrows():
-            if i == node1:
-                df_node_cluster.loc[i, 'cluster'] = 1
-            elif i == node2:
-                df_node_cluster.loc[i, 'cluster'] = 1
-            else:
-                df_node_cluster.loc[i, 'cluster'] = cluster_counter
-                cluster_counter = cluster_counter + 1
-
-        # define nodes of lines to clusters
-        lines = eva.assign_lines_to_clusters(lines, df_node_cluster)
-
-        # if lines have same cluster, drop in line and in PTDF matrix
-        if (lines['cluster1'] == lines['cluster2']).any():
-            drop_index = lines[lines['cluster1'] == lines['cluster2']][['bus1', 'bus2']]
-            df_ptdf.drop((drop_index['bus1'].values[0], drop_index['bus2'].values[0]), axis='index', inplace=True)
-            ptdf = df_ptdf.to_numpy()
-            lines.drop(drop_index.index, axis='index', inplace=True)
-
-        # need reduced ptdf for df_incidence_matrix
-        zone_incidence_matrix, _ = eva.get_node_zone_incidence_matrix(df_node_cluster, df_node_cluster['cluster'].max())
-        df_zone_incidence_matrix = pd.DataFrame(zone_incidence_matrix,
-                                                columns=df_node_cluster.index,
-                                                index=range(1, df_node_cluster['cluster'].max() + 1))
-
-        # get zone lines from lines witch have different clusters
-        zone_lines = lines.loc[lines['cluster1'] != lines['cluster2']]
-
-        # order zone lines in ascending order (by number of cluster)
-        for i, row in zone_lines.iterrows():
-            if row['cluster1'] > row['cluster2']:
-                zone_lines.loc[i, 'cluster1'], zone_lines.loc[i, 'cluster2'] = \
-                    zone_lines.loc[i, 'cluster2'], zone_lines.loc[i, 'cluster1']
-                zone_lines.loc[i, 'bus1'], zone_lines.loc[i, 'bus2'] = \
-                    zone_lines.loc[i, 'bus2'], zone_lines.loc[i, 'bus1']
-
-        # get lines between clusters and drop all duplicates
-        linked_zones = zone_lines[['cluster1', 'cluster2']].copy().astype(int)
-        linked_zones.drop_duplicates(inplace=True)
-
-        t_zone_links = list(zip(linked_zones['cluster1'].values, linked_zones['cluster2'].values))
-
-        lines.set_index(['bus1', 'bus2'], inplace=True, drop=False)
-
-        # inter zone lines are directed (1/-1)
-        df_inter_zones_lines = pd.DataFrame(0,
-                                            index=pd.MultiIndex.from_tuples(t_zone_links,
-                                                                            names=['cluster1', 'cluster2']),
-                                            columns=lines.index)
-        for i, row in lines.iterrows():
-            if (int(row['cluster1']), int(row['cluster2'])) in t_zone_links:
-                df_inter_zones_lines.loc[(int(row['cluster1']), int(row['cluster2'])), i] = 1
-            elif (int(row['cluster2']), int(row['cluster1'])) in t_zone_links:
-                df_inter_zones_lines.loc[(int(row['cluster2']), int(row['cluster1'])), i] = - 1
-
-        inter_zones_lines = df_inter_zones_lines.to_numpy()
-
-        end = time.time()
-        print('Time to create matrices: ' + str(end - start))
-
-        # get reduced ptdf matrix and save to input folder
-        df_ptdf, ptdf = eva.get_reduced_ptdf_matrix(ptdf, inter_zones_lines, df_inter_zones_lines,
-                                                    zone_incidence_matrix, df_T_bz=df_zone_incidence_matrix,
-                                                    df_ptdf=df_ptdf, use_df=True)
-
-        lines.drop(columns=['bus1', 'bus2'], inplace=True)
-        lines.rename(columns={'cluster1': 'bus1', 'cluster2': 'bus2'}, inplace=True)
-
-        # order lines to ascend order (by number of cluster)
-        for i, row in lines.iterrows():
-            if row['bus1'] > row['bus2']:
-                lines.loc[i, 'bus1'], lines.loc[i, 'bus2'] = \
-                    lines.loc[i, 'bus2'], lines.loc[i, 'bus1']
-
-        lines.reset_index(inplace=True, drop=True)
-        lines = lines.groupby(['bus1', 'bus2'], as_index=False).sum()
-        lines = lines.astype({'bus1': int, 'bus2': int})
-        lines.reset_index(inplace=True, drop=True)
         df_cluster_info = update_cluster_info(df_node_cluster, df_cluster_info)
 
-        # only export case if needed
+        # if only one aggregation is needed, return df_cluster_info
+        if len(l_number_of_clusters) == 1 and number_of_clusters in l_number_of_clusters:
+            return df_cluster_info
+
+        # define bus zone incidence matrix from df_node_cluster
+        df_zone_incidence_matrix = gp.get_node_zone_incidence_matrix(df_node_cluster)
+
         if number_of_clusters in l_number_of_clusters:
 
-            out_case = orig_case + '_red_' + cluster_by + '_' + str(number_of_clusters) + '_' + tec_type
-            gla.check_if_folder_exists_and_create('data', out_case)
+            # export grid partitioning time
+            end = time.time()
+            gp.export_grid_partitioning_time(res_path, case_folder, cluster_by, number_of_clusters, start, end)
 
-            # export again, so existing nodes have same cluster
-            df_bus_info = eva.export_assigned_clusters_to_bus_info(case_folder, df_node_cluster)
-            df_cluster_info.to_csv(os.path.join('data', out_case, 'cluster_info.csv'), sep=';', decimal=',', index=True)
+            # export aggregated grid
+            agg_case = f'{case_folder}_red_{cluster_by}_{number_of_clusters}_{tec_type}'
+            gla.check_if_folder_exists_and_create(data_folder, 'data', agg_case)
+            gp.export_aggregated_grid(res_path,
+                                      data_folder,
+                                      case_folder,
+                                      agg_case,
+                                      df_cluster_info,
+                                      lines,
+                                      df_ptdf.copy(),
+                                      slack_bus_original_grid
+                                      )
 
-            # export aggregated case
-            gla.assign_clustered_case('data', res_path, case_folder, out_case, 1,
-                                      df_bus_info=df_cluster_info)
+            start = time.time()  # start time for next iteration
 
-            # add Xline to lines if not exists
-            if 'Xline' not in lines.columns:
-                lines['Xline'] = 0.0
+        # define new zone node incidence matrix for next iteration
+        df_node_inc_matrix = (df_zone_incidence_matrix @ df_node_inc_matrix_unweighted @ df_zone_incidence_matrix.T).abs()
 
-            # export reduced ptdf & lines data
-            df_ptdf.to_csv(os.path.join('data', out_case, 'ptdf.csv'), index=True, sep=';', decimal=',')
-            lines.to_csv(os.path.join('data', out_case, 'lines.csv'), index=False, sep=';', decimal=',')
+        # reorder columns and index by natsorted columns
+        df_node_inc_matrix = df_node_inc_matrix[natsorted(df_node_inc_matrix.columns)]
+        df_node_inc_matrix = df_node_inc_matrix.reindex(natsorted(df_node_inc_matrix.index))
 
-            # set new case folder
-            # case_folder = out_case
+        if 'cluster' in distance_metric_sum.columns:
+            distance_metric_sum.drop(columns='cluster', inplace=True)
 
-        # redefine df_incidence_matrix
-        _, df_incidence_matrix = eva.get_incidence_matrix(lines, df_ptdf)
+        # distance_metric_sum['cluster'] = df_node_cluster['cluster']
+        distance_metric_sum = distance_metric_sum.join(df_node_cluster, how='left')
 
-        # # make mean of lmp diff
-        # df_lmp_diff['cluster'] = df_node_cluster['cluster']
-        #
-        # # redefine df_lmp_diff
-        # df_lmp_diff = df_lmp_diff.groupby('cluster').mean()
-        # df_lmp_diff.index.name = 'OldCluster'
+        # calculate the sum of the values in distance_metric_sum per cluster
+        distance_metric_sum = distance_metric_sum.groupby('cluster').sum()
+        distance_metric_sum = distance_metric_sum.reindex(natsorted(distance_metric_sum.index))
+        distance_metric_sum.index = distance_metric_sum.index.astype(str)
 
-        # make weighted mean of lmp diff
-        # define new cluster in df_lmp_diff_sum
-        df_lmp_diff_sum['cluster'] = df_node_cluster['cluster']
+        # calculate new distance_metric by dividing the sum by the number of nodes in the cluster
+        distance_metric = (distance_metric_sum.T / distance_metric_sum['counter']).T
+        distance_metric.drop(columns="counter", inplace=True)
+        distance_metric.index.name = 'OldCluster'
 
-        # calculate the sum of the values in df_lmp_diff_sum per cluster
-        df_lmp_diff_sum = df_lmp_diff_sum.groupby('cluster').sum()
+        # reduce number of clusters
+        number_of_clusters = number_of_clusters - 1
 
-        # calculate new df_lmp_diff by dividing the sum by the number of nodes in the cluster
-        df_lmp_diff = (df_lmp_diff_sum.T / df_lmp_diff_sum['counter']).T
-        df_lmp_diff.drop(columns="counter", inplace=True)
-        df_lmp_diff.index.name = 'OldCluster'
-
-        loop_counter = loop_counter + 1
+        # end while
 
 
-    return None
+    return pd.DataFrame
 
 
 
 
 if __name__ == '__main__':
 
+    periods = 1
+    results_folder = os.path.join('..', '..', 'GridAggregation', 'results')
+    data_folder = os.path.join('..', '..', 'GridAggregation')
     case_folder = 'IEEE_24_p19'
-    results_path = os.path.join('.', 'results')
-    cluster_methods = [
-        'itClusterLMP',  # LMP-ANAC
-        'itClusterNCI'   # NCP-ANAC
-    ]
-    l_num_of_nodes = list(range(23, 0, -1))
+    cluster_by = 'lmpAnac'
+    l_num_of_nodes = list(range(24, 0, -1))
 
-    for cluster_by in cluster_methods:
-        iterative_clustering(case_folder, results_path, cluster_by=cluster_by, l_number_of_clusters=l_num_of_nodes)
+    iterative_clustering(case_folder,
+                         results_path,
+                         data_folder,
+                         cluster_by=cluster_by,
+                         l_number_of_clusters=l_num_of_nodes
+                         )
 
 
